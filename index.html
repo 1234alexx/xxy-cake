@@ -1510,7 +1510,14 @@
       blockedName: "",
       stable: { name:"", count:0 },
       rotTarget: new THREE.Vector2(0,0),
-      rotCurrent: new THREE.Vector2(0,0)
+      rotCurrent: new THREE.Vector2(0,0),
+      handPresentUntil: 0
+    };
+
+    const handLoop = {
+      active: false,
+      usingRVFC: false,
+      timer: 0
     };
 
     function dist3(a,b){
@@ -1564,28 +1571,106 @@
     }
 
     function maybeSwitchByGesture(name){
+      function desiredStateFor(name){
+        if(name === "PINCH") return STATE.FOCUS;
+        if(name === "OPEN") return STATE.SCATTER;
+        return STATE.CAKE; // FIST/DEFAULT
+      }
+
+      const desired = desiredStateFor(name);
+
       // Only allow one gesture-triggered transition at a time.
       // When a gesture triggers, it becomes "blocked" until the user changes gesture.
-      if(transition.active) return;
+      // Allow interrupting an in-flight transition if the user asks for a different target state.
+      if(transition.active && desired === transition.to) return;
       if(gesture.blockedName && name === gesture.blockedName) return;
 
       const now = performance.now();
       if(now - gesture.lastSwitch < gesture.cooldownMs) return;
 
       if(name === "PINCH"){
-        setState(STATE.FOCUS);
+        setState(desired);
         gesture.lastSwitch = now;
         gesture.blockedName = name;
       } else if(name === "OPEN"){
-        setState(STATE.SCATTER);
+        setState(desired);
         gesture.lastSwitch = now;
         gesture.blockedName = name;
       } else if(name === "FIST" || name === "DEFAULT"){
-        setState(STATE.CAKE);
+        setState(desired);
         gesture.lastSwitch = now;
         gesture.blockedName = name;
       }
     }
+
+    function processHandFrame(nowMs){
+      if(!mpReady || !handLandmarker || !video || video.readyState < 2) return;
+      if(document.hidden) return;
+
+      const res = handLandmarker.detectForVideo(video, nowMs);
+      const hand = res?.landmarks?.[0];
+      if(!hand) return;
+
+      gesture.handPresentUntil = performance.now() + 160;
+      const g = detectGesture(hand);
+
+      if(gesture.stable.name === g.name) gesture.stable.count++;
+      else { gesture.stable.name = g.name; gesture.stable.count = 1; }
+
+      if(gesture.stable.count >= 3){
+        // Re-arm gesture triggers only after the user holds a different gesture stably.
+        if(gesture.blockedName && gesture.stable.name !== gesture.blockedName){
+          gesture.blockedName = "";
+        }
+        maybeSwitchByGesture(g.name);
+      }
+
+      const px = (g.palm.x - 0.5) * 2;
+      const py = (g.palm.y - 0.5) * 2;
+      gesture.rotTarget.set(
+        clamp(-py * 0.22, -0.22, 0.22),
+        clamp(px  * 0.36, -0.36, 0.36)
+      );
+    }
+
+    function startHandLoop(){
+      if(handLoop.active) return;
+      handLoop.active = true;
+
+      if(video && typeof video.requestVideoFrameCallback === "function"){
+        handLoop.usingRVFC = true;
+        const cb = (nowMs)=>{
+          if(!handLoop.active) return;
+          processHandFrame(nowMs);
+          video.requestVideoFrameCallback(cb);
+        };
+        video.requestVideoFrameCallback(cb);
+        return;
+      }
+
+      handLoop.usingRVFC = false;
+      const tick = ()=>{
+        if(!handLoop.active) return;
+        processHandFrame(performance.now());
+        handLoop.timer = window.setTimeout(tick, 33);
+      };
+      tick();
+    }
+
+    function stopHandLoop(){
+      handLoop.active = false;
+      if(!handLoop.usingRVFC && handLoop.timer) window.clearTimeout(handLoop.timer);
+      handLoop.timer = 0;
+      gesture.handPresentUntil = 0;
+      gesture.stable.name = "";
+      gesture.stable.count = 0;
+    }
+
+    document.addEventListener("visibilitychange", ()=>{
+      if(document.hidden){
+        gesture.handPresentUntil = 0;
+      }
+    }, { passive:true });
 
     async function initMediaPipe(){
       try{
@@ -1603,7 +1688,16 @@
         video.style.height = "1px";
         document.body.appendChild(video);
 
-        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user" }, audio:false });
+        // Keep camera frames small for performance (hand detection doesn't need HD).
+        let stream = null;
+        try{
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
+            audio:false
+          });
+        }catch{
+          stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user" }, audio:false });
+        }
         video.srcObject = stream;
         await new Promise(res=>{ video.onloadedmetadata = ()=>res(); });
 
@@ -1621,6 +1715,7 @@
 
         mpReady = true;
         showNotice("手势已启用：捏合/张开/握拳（手势优先覆盖鼠标）");
+        startHandLoop();
       }catch(err){
         mpReady = false;
         showNotice("摄像头/手势不可用：请用键盘 1/2/3（常见原因：权限被拒或非安全上下文）");
@@ -1647,37 +1742,11 @@
       starMat.opacity = 0.86 + 0.10 * Math.sin(t * 0.60);
 
       // hand -> rotation + state (overrides mouse when hand present)
-      let handPresent = false;
-      if(mpReady && handLandmarker && video && video.readyState >= 2){
-        const res = handLandmarker.detectForVideo(video, now);
-        const hand = res?.landmarks?.[0];
-        if(hand){
-          handPresent = true;
-          const g = detectGesture(hand);
-
-          if(gesture.stable.name === g.name) gesture.stable.count++;
-          else { gesture.stable.name = g.name; gesture.stable.count = 1; }
-
-          if(gesture.stable.count >= 3){
-            // Re-arm gesture triggers only after the user holds a different gesture stably.
-            if(gesture.blockedName && gesture.stable.name !== gesture.blockedName){
-              gesture.blockedName = "";
-            }
-            maybeSwitchByGesture(g.name);
-          }
-
-          const px = (g.palm.x - 0.5) * 2;
-          const py = (g.palm.y - 0.5) * 2;
-          gesture.rotTarget.set(
-            clamp(-py * 0.22, -0.22, 0.22),
-            clamp(px  * 0.36, -0.36, 0.36)
-          );
-
-          gesture.rotCurrent.lerp(gesture.rotTarget, 0.10);
-          rot.target.set(gesture.rotCurrent.x, gesture.rotCurrent.y);
-        }
-      }
-      if(!handPresent){
+      const handPresent = performance.now() < gesture.handPresentUntil;
+      if(handPresent){
+        gesture.rotCurrent.lerp(gesture.rotTarget, 0.10);
+        rot.target.set(gesture.rotCurrent.x, gesture.rotCurrent.y);
+      } else {
         rot.target.set(
           clamp(-mouseFallback.y * 0.12, -0.14, 0.14),
           clamp( mouseFallback.x * 0.20, -0.22, 0.22)
