@@ -148,6 +148,7 @@
     const $ = (s)=>document.querySelector(s);
     const loadingEl = $("#loading");
     const noticeEl  = $("#notice");
+    const loadingTextEl = document.querySelector(".loadingText");
     // Upload UI removed; photos come from DEFAULT_PHOTOS below.
 
     const bootState = { t0: performance.now(), firstRender:false };
@@ -164,16 +165,27 @@
       if(loadingEl.style.display === "none") return;
       const elapsed = now - bootState.t0;
       const minMs = 1200;
-      const maxMs = 7000;
-      const wantLoaded = (photoLoad.total > 0) ? Math.min(3, photoLoad.total) : 0;
-      const photosOk =
-        (photoLoad.total === 0) ||
-        (photoLoad.loaded >= wantLoaded) ||
-        (photoLoad.settled >= photoLoad.total) ||
-        (elapsed >= maxMs);
+      const maxMs = 25000; // fail-safe only
 
-      if(bootState.firstRender && elapsed >= minMs && photosOk){
+      const total = Math.max(0, photoLoad.total | 0);
+      const loaded = Math.max(0, photoLoad.loaded | 0);
+      const settled = Math.max(0, photoLoad.settled | 0);
+
+      if(loadingTextEl){
+        if(total > 0) loadingTextEl.textContent = `Loading xxy’s birthday cake • ${Math.min(loaded,total)}/${total} photos loaded`;
+        else loadingTextEl.textContent = "Loading xxy’s birthday cake";
+      }
+
+      // Stay on the loading screen until all photos are loaded successfully.
+      // (Fail-safe timeout to avoid getting stuck forever on bad networks.)
+      const photosOk = (total === 0) ? true : (loaded >= total);
+      const timeout = elapsed >= maxMs;
+
+      if(bootState.firstRender && elapsed >= minMs && (photosOk || timeout)){
         loadingEl.style.display = "none";
+        if(timeout && total > 0 && loaded < total){
+          showNotice(`Photos loaded: ${loaded}/${total} (network slow)`);
+        }
       }
     }
 
@@ -1173,7 +1185,9 @@
         showNotice("当前通过 file:// 打开，浏览器会禁止 WebGL 读取本地图片（CORS/origin=null）。请用 Live Server/本地服务器打开，例如 http://127.0.0.1:5500/cake_points.html");
         return;
       }
-      for(const p of DEFAULT_PHOTOS){
+      const list = DEFAULT_PHOTOS.filter(p => p?.src);
+      photoLoad.total = list.length;
+      for(const p of list){
         if(!p?.src) continue;
         const scheduled = addPhotoFromUrlSafe(p.src, p.name, {
           silent: true,
@@ -1182,7 +1196,9 @@
             if(ok) photoLoad.loaded++;
           }
         });
-        if(scheduled) photoLoad.total++;
+        if(!scheduled){
+          photoLoad.total = Math.max(0, photoLoad.total - 1);
+        }
       }
     }
 
