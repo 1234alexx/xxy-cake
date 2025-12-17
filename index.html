@@ -168,10 +168,10 @@
 
     const PERF = {
       // iOS Safari is more prone to WebGL memory pressure -> keep resolution & textures smaller
-      maxPixelRatio: DEVICE.isIOS ? 1.25 : 2.0,
-      bloomScale: DEVICE.isIOS ? 0.65 : 1.0,
+      maxPixelRatio: DEVICE.isIOS ? 1.75 : 2.0,
+      bloomScale: DEVICE.isIOS ? 0.9 : 1.0,
       // Downscale large photos before uploading to GPU
-      maxPhotoDim: DEVICE.isIOS ? 768 : 1024
+      maxPhotoDim: DEVICE.isIOS ? 1280 : 1400
     };
 
     function showNotice(msg){
@@ -282,11 +282,16 @@
         if(typeof createImageBitmap === "function"){
           try{
             const bitmap = await createImageBitmap(img, {
+              imageOrientation: "flipY",
               resizeWidth: tw,
               resizeHeight: th,
               resizeQuality: "high"
             });
+            if(typeof ImageBitmap !== "undefined" && img instanceof ImageBitmap){
+              try{ img.close(); }catch{}
+            }
             tex.image = bitmap;
+            tex.flipY = false;
             tex.needsUpdate = true;
             return;
           }catch{
@@ -300,7 +305,11 @@
         const ctx = c.getContext("2d");
         if(!ctx) return;
         ctx.drawImage(img, 0, 0, tw, th);
+        if(typeof ImageBitmap !== "undefined" && img instanceof ImageBitmap){
+          try{ img.close(); }catch{}
+        }
         tex.image = c;
+        tex.flipY = true;
         tex.needsUpdate = true;
       }catch{
         // ignore: keep original texture
@@ -329,11 +338,12 @@
       // Decode directly to a smaller bitmap to reduce peak memory on iOS Safari.
       // Use a conservative bound; aspect is preserved by the browser.
       const bitmap = await createImageBitmap(blob, {
+        imageOrientation: "flipY",
         resizeWidth: maxDim,
-        resizeHeight: maxDim,
         resizeQuality: "high"
       });
       const tex = new THREE.Texture(bitmap);
+      tex.flipY = false;
       tex.needsUpdate = true;
       return tex;
     }
@@ -1290,19 +1300,21 @@
       }
       const list = DEFAULT_PHOTOS.filter(p => p?.src);
       photoLoad.total = list.length;
-      for(const p of list){
-        if(!p?.src) continue;
-        const scheduled = addPhotoFromUrlSafe(p.src, p.name, {
-          silent: true,
-          onSettled: (ok)=>{
+      const concurrency = DEVICE.isIOS ? 2 : 4;
+      (async ()=>{
+        let cursor = 0;
+        async function worker(){
+          while(cursor < list.length){
+            const i = cursor++;
+            const p = list[i];
+            if(!p?.src) continue;
+            const ok = await addPhotoFromUrlSafe(p.src, p.name, { silent: true });
             photoLoad.settled++;
             if(ok) photoLoad.loaded++;
           }
-        });
-        if(!scheduled){
-          photoLoad.total = Math.max(0, photoLoad.total - 1);
         }
-      }
+        await Promise.all(Array.from({ length: Math.max(1, concurrency) }, worker));
+      })();
     }
 
     // Safer, readable loader (used by defaults). Keep separate to avoid encoding issues above.
@@ -1314,31 +1326,25 @@
       return true;
     }
 
-    function addPhotoFromUrlSafe(src, name, { silent = false, onSettled } = {}){
-      if(!canAddPhotoSafe()) return false;
-      (async ()=>{
-        try{
-          let tex;
-          if(DEVICE.isIOS && typeof fetch === "function"){
-            tex = await loadTextureResized(src, PERF.maxPhotoDim);
+    function addPhotoFromUrlSafe(src, name, { silent = false } = {}){
+      if(!canAddPhotoSafe()) return Promise.resolve(false);
+      return new Promise((resolve)=>{
+        const loader = new THREE.TextureLoader();
+        loader.setCrossOrigin("anonymous");
+        loader.load(src, (tex)=>{
+          (async ()=>{
             await downscaleTextureInPlace(tex, PERF.maxPhotoDim);
-          } else {
-            tex = await new Promise((resolve, reject)=>{
-              const loader = new THREE.TextureLoader();
-              loader.setCrossOrigin("anonymous");
-              loader.load(src, resolve, undefined, reject);
-            });
-            await downscaleTextureInPlace(tex, PERF.maxPhotoDim);
-          }
-
-          addPhotoFromTexture(tex, silent ? null : (name || "Default photo"));
-          if(typeof onSettled === "function") onSettled(true);
-        }catch{
+            addPhotoFromTexture(tex, silent ? null : (name || "Default photo"));
+            resolve(true);
+          })().catch(()=>{
+            showNotice(`Photo load failed: ${name || src}`);
+            resolve(false);
+          });
+        }, undefined, ()=>{
           showNotice(`Photo load failed: ${name || src}`);
-          if(typeof onSettled === "function") onSettled(false);
-        }
-      })();
-      return true;
+          resolve(false);
+        });
+      });
     }
 
     /***************************************************************
