@@ -456,6 +456,7 @@
       toneMapped: false,
       uniforms: {
         uMix: { value: 0.0 },
+        uBurst: { value: 0.0 },
         uTime: { value: 0.0 },
         uPointSize: { value: 1.05 },
         uPixelRatio: { value: renderer.getPixelRatio() },
@@ -467,6 +468,7 @@
         attribute float aSeed;
         attribute float aSize;
         uniform float uMix;
+        uniform float uBurst;
         uniform float uTime;
         uniform float uPointSize;
         uniform float uPixelRatio;
@@ -490,6 +492,17 @@
             sin(uTime*0.70 + aSeed*8.0),
             cos(uTime*0.50 + aSeed*10.0)
           ) * (uDriftAmp * drift);
+
+          // "Scatter then gather" path: peak at mid-transition to avoid pure translation,
+          // especially for SCATTER->SCATTER and focus center changes.
+          float burst = uBurst * sin(3.14159265 * k);
+          vec3 rnd = vec3(
+            sin(aSeed*12.3),
+            cos(aSeed*7.1) * 0.55,
+            sin(aSeed*5.7)
+          );
+          rnd = normalize(rnd + vec3(1e-4));
+          p += rnd * burst * 2.10;
 
           float tw =
             0.92 +
@@ -531,8 +544,111 @@
       candles: null,
       flames: null,
       candleMat: null,
-      flameMat: null
+      flameMat: null,
+      candleFrom: null,
+      candleTo: null,
+      candleBase: null,
+      candleSeed: null,
+      flameFrom: null,
+      flameTo: null,
+      flameBase: null,
+      flameSeed: null,
+      flameLift: null,
+      flameCount: 0
     };
+
+    function seeded01(x){
+      const y = Math.sin(x * 43758.5453123) * 43758.5453123;
+      return y - Math.floor(y);
+    }
+
+    function computeCandleTargetsForState(state){
+      if(!candleFX.candleFrom || !candleFX.candleTo || !candleFX.candleBase) return;
+      if(!candleFX.flameFrom || !candleFX.flameTo || !candleFX.flameBase) return;
+
+      if(state === STATE.CAKE){
+        candleFX.candleTo.set(candleFX.candleBase);
+        candleFX.flameTo.set(candleFX.flameBase);
+        candleFX.candles.geometry.attributes.aTo.needsUpdate = true;
+        candleFX.flames.geometry.attributes.aTo.needsUpdate = true;
+        return;
+      }
+
+      // Determine a target center: SCATTER around origin, FOCUS around the focus ring center.
+      const center = computeCandleTargetsForState._center;
+      if(state === STATE.FOCUS && photos.length > 0){
+        center.copy(tmpFocusPos);
+      } else {
+        center.set(0, 1.2, 0);
+      }
+
+      // Candle body targets
+      for(let i=0;i<candleFX.candleSeed.length;i++){
+        const s = candleFX.candleSeed[i];
+        const a = (s * 6.2831853) + (seeded01(s + 11.1) - 0.5) * 0.35;
+        const u = seeded01(s + 3.3);
+        const v = seeded01(s + 7.7);
+
+        if(state === STATE.SCATTER){
+          const R0 = 9.8 + (u - 0.5) * 3.0;
+          const y0 = (v - 0.5) * 4.2 + 1.2;
+          candleFX.candleTo[i*3+0] = Math.cos(a) * R0;
+          candleFX.candleTo[i*3+1] = y0;
+          candleFX.candleTo[i*3+2] = Math.sin(a) * R0;
+        } else {
+          // FOCUS: join the halo around the focused photo
+          const ringR = 1.20 + (u - 0.5) * 0.55;
+          const y = center.y + (v - 0.5) * 0.45;
+          candleFX.candleTo[i*3+0] = center.x + Math.cos(a) * ringR;
+          candleFX.candleTo[i*3+1] = y;
+          candleFX.candleTo[i*3+2] = center.z + Math.sin(a) * ringR;
+        }
+      }
+
+      // Flame targets: similar, but slightly higher
+      for(let i=0;i<candleFX.flameSeed.length;i++){
+        const s = candleFX.flameSeed[i];
+        const a = (s * 6.2831853) + (seeded01(s + 21.1) - 0.5) * 0.45;
+        const u = seeded01(s + 31.3);
+        const v = seeded01(s + 17.7);
+        const lift = candleFX.flameLift ? candleFX.flameLift[i] : 0.5;
+
+        if(state === STATE.SCATTER){
+          const R0 = 9.9 + (u - 0.5) * 3.2;
+          const y0 = (v - 0.5) * 4.5 + 1.35 + lift * 0.35;
+          candleFX.flameTo[i*3+0] = Math.cos(a) * R0;
+          candleFX.flameTo[i*3+1] = y0;
+          candleFX.flameTo[i*3+2] = Math.sin(a) * R0;
+        } else {
+          const ringR = 1.15 + (u - 0.5) * 0.70;
+          const y = center.y + (v - 0.5) * 0.55 + lift * 0.22;
+          candleFX.flameTo[i*3+0] = center.x + Math.cos(a) * ringR;
+          candleFX.flameTo[i*3+1] = y;
+          candleFX.flameTo[i*3+2] = center.z + Math.sin(a) * ringR;
+        }
+      }
+
+      candleFX.candles.geometry.attributes.aTo.needsUpdate = true;
+      candleFX.flames.geometry.attributes.aTo.needsUpdate = true;
+    }
+    computeCandleTargetsForState._center = new THREE.Vector3();
+
+    function snapshotCandlesToFrom(){
+      if(!candleFX.candleFrom || !candleFX.candleTo) return;
+      if(!candleFX.flameFrom || !candleFX.flameTo) return;
+      const now = performance.now();
+      const t = transition.active ? clamp((now - transition.t0) / transition.dur, 0, 1) : 1;
+      const k = easeInOut(t);
+
+      for(let i=0;i<candleFX.candleFrom.length;i++){
+        candleFX.candleFrom[i] = candleFX.candleFrom[i] + (candleFX.candleTo[i] - candleFX.candleFrom[i]) * k;
+      }
+      for(let i=0;i<candleFX.flameFrom.length;i++){
+        candleFX.flameFrom[i] = candleFX.flameFrom[i] + (candleFX.flameTo[i] - candleFX.flameFrom[i]) * k;
+      }
+      candleFX.candles.geometry.attributes.position.needsUpdate = true;
+      candleFX.flames.geometry.attributes.position.needsUpdate = true;
+    }
 
     function createCandles(){
       candleGroup.clear();
@@ -625,7 +741,10 @@
       }
 
       const candleGeo = new THREE.BufferGeometry();
-      candleGeo.setAttribute("position", new THREE.BufferAttribute(candlePos, 3));
+      const candleFrom = candlePos;
+      const candleTo = new Float32Array(candleFrom);
+      candleGeo.setAttribute("position", new THREE.BufferAttribute(candleFrom, 3)); // from
+      candleGeo.setAttribute("aTo", new THREE.BufferAttribute(candleTo, 3));
       candleGeo.setAttribute("color", new THREE.BufferAttribute(candleCol, 3));
       candleGeo.setAttribute("aSeed", new THREE.BufferAttribute(candleSeed, 1));
       candleGeo.setAttribute("aSize", new THREE.BufferAttribute(candleSize, 1));
@@ -639,21 +758,35 @@
         vertexColors: true,
         toneMapped: false,
         uniforms: {
+          uMix: { value: 0.0 },
+          uBurst: { value: 0.0 },
           uTime: { value: 0.0 },
           uPointSize: { value: 1.20 },
           uPixelRatio: { value: renderer.getPixelRatio() }
         },
         vertexShader: /* glsl */`
+          attribute vec3 aTo;
           attribute float aSeed;
           attribute float aSize;
+          uniform float uMix;
+          uniform float uBurst;
           uniform float uTime;
           uniform float uPointSize;
           uniform float uPixelRatio;
           varying vec3 vColor;
+          float easeInOut(float t){
+            return t < 0.5 ? 2.0*t*t : 1.0 - pow(-2.0*t + 2.0, 2.0) * 0.5;
+          }
           void main(){
             vColor = color;
-            vec3 p = position;
+            float k = easeInOut(clamp(uMix, 0.0, 1.0));
+            vec3 p = mix(position, aTo, k);
             float tw = 0.6 + 0.4*sin(uTime*2.2 + aSeed*12.0);
+            float burst = uBurst * sin(3.14159265 * k);
+            vec3 dir = vec3(sin(aSeed*12.3), cos(aSeed*7.1) * 0.30, sin(aSeed*5.7));
+            dir = normalize(dir + vec3(1e-4));
+            p += dir * burst * 0.55;
+
             vec4 mv = modelViewMatrix * vec4(p, 1.0);
             gl_Position = projectionMatrix * mv;
             float perspective = 320.0 / max(1.0, -mv.z);
@@ -674,7 +807,10 @@
       });
 
       const flameGeo = new THREE.BufferGeometry();
-      flameGeo.setAttribute("position", new THREE.BufferAttribute(flamePos, 3));
+      const flameFrom = flamePos;
+      const flameTo = new Float32Array(flameFrom);
+      flameGeo.setAttribute("position", new THREE.BufferAttribute(flameFrom, 3)); // from
+      flameGeo.setAttribute("aTo", new THREE.BufferAttribute(flameTo, 3));
       flameGeo.setAttribute("color", new THREE.BufferAttribute(flameCol, 3));
       flameGeo.setAttribute("aSeed", new THREE.BufferAttribute(flameSeed, 1));
       flameGeo.setAttribute("aLift", new THREE.BufferAttribute(flameLift, 1));
@@ -689,23 +825,32 @@
         vertexColors: true,
         toneMapped: false,
         uniforms: {
+          uMix: { value: 0.0 },
+          uBurst: { value: 0.0 },
           uTime: { value: 0.0 },
           uPointSize: { value: 1.15 },
           uPixelRatio: { value: renderer.getPixelRatio() }
         },
         vertexShader: /* glsl */`
+          attribute vec3 aTo;
           attribute float aSeed;
           attribute float aLift;
           attribute float aSize;
+          uniform float uMix;
+          uniform float uBurst;
           uniform float uTime;
           uniform float uPointSize;
           uniform float uPixelRatio;
           varying vec3 vColor;
           varying float vLift;
+          float easeInOut(float t){
+            return t < 0.5 ? 2.0*t*t : 1.0 - pow(-2.0*t + 2.0, 2.0) * 0.5;
+          }
           void main(){
             vColor = color;
             vLift = aLift;
-            vec3 p = position;
+            float mixK = easeInOut(clamp(uMix, 0.0, 1.0));
+            vec3 p = mix(position, aTo, mixK);
 
             float flicker =
               0.55*sin(uTime*8.5 + aSeed*20.0) +
@@ -715,6 +860,11 @@
             p.x += 0.015 * k * sway;
             p.z += 0.015 * k * cos(uTime*2.0 + aSeed*8.0);
             p.y += 0.030 * k * (0.55 + 0.45*flicker);
+
+            float burst = uBurst * sin(3.14159265 * mixK);
+            vec3 dir = vec3(sin(aSeed*10.7), 0.55 + 0.30*sin(aSeed*6.9), cos(aSeed*8.4));
+            dir = normalize(dir + vec3(1e-4));
+            p += dir * burst * (0.42 * (0.35 + 0.65*k));
 
             vec4 mv = modelViewMatrix * vec4(p, 1.0);
             gl_Position = projectionMatrix * mv;
@@ -751,12 +901,28 @@
       candleFX.flames = flamePts;
       candleFX.candleMat = candleMat;
       candleFX.flameMat = flameMat;
+      candleFX.candleFrom = candleFrom;
+      candleFX.candleTo = candleTo;
+      candleFX.candleBase = new Float32Array(candleFrom);
+      candleFX.candleSeed = candleSeed;
+      candleFX.flameFrom = flameFrom;
+      candleFX.flameTo = flameTo;
+      candleFX.flameBase = new Float32Array(flameFrom);
+      candleFX.flameSeed = flameSeed;
+      candleFX.flameLift = flameLift;
+      candleFX.flameCount = flameSeed.length;
+
+      computeCandleTargetsForState(STATE.CAKE);
     }
     createCandles();
 
-    function updateCandles(t){
+    function updateCandles(t, mix, burst){
       if(candleFX.candleMat) candleFX.candleMat.uniforms.uTime.value = t;
       if(candleFX.flameMat) candleFX.flameMat.uniforms.uTime.value = t;
+      if(candleFX.candleMat) candleFX.candleMat.uniforms.uMix.value = mix;
+      if(candleFX.flameMat) candleFX.flameMat.uniforms.uMix.value = mix;
+      if(candleFX.candleMat) candleFX.candleMat.uniforms.uBurst.value = burst;
+      if(candleFX.flameMat) candleFX.flameMat.uniforms.uBurst.value = burst;
     }
 
     /***************************************************************
@@ -1148,17 +1314,19 @@
         focusedPhotoIndex = nextFocusIndex;
       }
 
+      // Keep candle/flame particles in the same state machine
+      snapshotCandlesToFrom();
       snapshotCurrentToFrom();
       computeTargetsForState(next);
+      computeCandleTargetsForState(next);
 
+      const nextDur = (next === STATE.FOCUS) ? 2400 : 1500;
+      transition.dur = nextDur;
       transition.active = true;
       transition.t0 = performance.now();
       transition.from = currentState;
       transition.to = next;
       currentState = next;
-
-      // candles only in CAKE
-      candleGroup.visible = (next === STATE.CAKE);
 
       // drift amplitude per state
       pointsMat.uniforms.uDriftAmp.value = (next === STATE.SCATTER) ? 0.10 : (next === STATE.FOCUS ? 0.08 : 0.045);
@@ -1427,8 +1595,9 @@
     }
 
     function updateCamera(){
-      camRig.pos.lerp(camRig.targetPos, 0.06);
-      camRig.look.lerp(camRig.targetLook, 0.08);
+      const focusing = (currentState === STATE.FOCUS) || (transition.active && transition.to === STATE.FOCUS);
+      camRig.pos.lerp(camRig.targetPos, focusing ? 0.045 : 0.06);
+      camRig.look.lerp(camRig.targetLook, focusing ? 0.060 : 0.08);
       camera.position.copy(camRig.pos);
       camera.lookAt(camRig.look);
     }
@@ -1485,23 +1654,61 @@
       // transition uniform
       const fromState = transition.active ? transition.from : currentState;
       const toState = transition.active ? transition.to : currentState;
+      let candleMix = 0.0;
+      let candleBurst = 0.0;
       if(transition.active){
         const u = clamp((now - transition.t0) / transition.dur, 0, 1);
+        const k = easeInOut(u);
         pointsMat.uniforms.uMix.value = u;
-        updatePhotoWallVisuals(fromState, toState, easeInOut(u), transition.fromFocusIndex, transition.toFocusIndex);
+        const burst =
+          (fromState === STATE.SCATTER && toState === STATE.SCATTER) ||
+          (toState === STATE.FOCUS && (
+            fromState === STATE.SCATTER ||
+            (fromState === STATE.FOCUS && transition.fromFocusIndex !== transition.toFocusIndex)
+          ));
+        pointsMat.uniforms.uBurst.value = burst ? 1.0 : 0.0;
+
+        updatePhotoWallVisuals(fromState, toState, k, transition.fromFocusIndex, transition.toFocusIndex);
         if(toState === STATE.FOCUS) setCameraTargetsForState(STATE.FOCUS);
-        if(u >= 1){
+
+        candleMix = u;
+        candleBurst = burst ? 1.0 : 0.0;
+
+        let shouldFinish = (u >= 1);
+        if(shouldFinish && toState === STATE.FOCUS){
+          const posErr = camRig.pos.distanceTo(camRig.targetPos);
+          const lookErr = camRig.look.distanceTo(camRig.targetLook);
+          // Finish focus transition only after the camera has effectively arrived.
+          if(posErr > 0.06 || lookErr > 0.06) shouldFinish = false;
+        }
+
+        if(shouldFinish){
           transition.active = false;
           // settle: from = to (so next switch doesn't need a huge lerp)
           for(let i=0;i<N*3;i++){ posFrom[i] = posTo[i]; colFrom[i] = colTo[i]; }
           pointsGeo.attributes.position.needsUpdate = true;
           pointsGeo.attributes.color.needsUpdate = true;
           pointsMat.uniforms.uMix.value = 0.0;
+          pointsMat.uniforms.uBurst.value = 0.0;
+
+          if(candleFX.candleFrom && candleFX.candleTo){
+            candleFX.candleFrom.set(candleFX.candleTo);
+            candleFX.candles.geometry.attributes.position.needsUpdate = true;
+          }
+          if(candleFX.flameFrom && candleFX.flameTo){
+            candleFX.flameFrom.set(candleFX.flameTo);
+            candleFX.flames.geometry.attributes.position.needsUpdate = true;
+          }
+          candleMix = 0.0;
+          candleBurst = 0.0;
         }
       } else {
         pointsMat.uniforms.uMix.value = 0.0;
+        pointsMat.uniforms.uBurst.value = 0.0;
         updatePhotoWallVisuals(currentState, currentState, 1.0, focusedPhotoIndex, focusedPhotoIndex);
         if(currentState === STATE.FOCUS) setCameraTargetsForState(STATE.FOCUS);
+        candleMix = 0.0;
+        candleBurst = 0.0;
       }
 
       // rotation smoothing
@@ -1512,7 +1719,8 @@
       pointsMat.uniforms.uTime.value = t;
       updateCamera();
 
-      if(candleGroup.visible) updateCandles(t);
+      candleGroup.visible = true;
+      updateCandles(t, candleMix, candleBurst);
       composer.render();
 
       requestAnimationFrame(animate);
