@@ -168,10 +168,10 @@
 
     const PERF = {
       // iOS Safari is more prone to WebGL memory pressure -> keep resolution & textures smaller
-      maxPixelRatio: DEVICE.isIOS ? 1.75 : 2.0,
-      bloomScale: DEVICE.isIOS ? 0.9 : 1.0,
+      maxPixelRatio: DEVICE.isIOS ? 1.9 : 2.0,
+      bloomScale: DEVICE.isIOS ? 1.0 : 1.0,
       // Downscale large photos before uploading to GPU
-      maxPhotoDim: DEVICE.isIOS ? 1280 : 1400
+      maxPhotoDim: DEVICE.isIOS ? 1440 : 1400
     };
 
     function showNotice(msg){
