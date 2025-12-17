@@ -154,6 +154,26 @@
     const bootState = { t0: performance.now(), firstRender:false };
     const photoLoad = { total:0, settled:0, loaded:0 };
 
+    const DEVICE = (() => {
+      const ua = navigator.userAgent || "";
+      const isIOS =
+        /iPad|iPhone|iPod/.test(ua) ||
+        (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+      const isMobile =
+        isIOS ||
+        /Android/i.test(ua) ||
+        (window.matchMedia && window.matchMedia("(pointer:coarse)").matches);
+      return { isIOS, isMobile };
+    })();
+
+    const PERF = {
+      // iOS Safari is more prone to WebGL memory pressure -> keep resolution & textures smaller
+      maxPixelRatio: DEVICE.isIOS ? 1.25 : 2.0,
+      bloomScale: DEVICE.isIOS ? 0.65 : 1.0,
+      // Downscale large photos before uploading to GPU
+      maxPhotoDim: DEVICE.isIOS ? 768 : 1024
+    };
+
     function showNotice(msg){
       noticeEl.style.display = "block";
       noticeEl.textContent = msg;
@@ -195,7 +215,7 @@
 
     const canvas = $("#c");
     const renderer = new THREE.WebGLRenderer({ canvas, antialias:true, alpha:false, powerPreference:"high-performance" });
-    renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+    renderer.setPixelRatio(Math.min(PERF.maxPixelRatio, window.devicePixelRatio || 1));
     renderer.setSize(window.innerWidth, window.innerHeight);
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -235,6 +255,88 @@
       0.22
     );
     composer.addPass(bloom);
+    bloom.setSize(window.innerWidth * PERF.bloomScale, window.innerHeight * PERF.bloomScale);
+
+    function configurePhotoTexture(tex){
+      // Reduce GPU memory (mipmaps are expensive for large photos and not needed here).
+      tex.generateMipmaps = false;
+      tex.minFilter = THREE.LinearFilter;
+      tex.magFilter = THREE.LinearFilter;
+      tex.anisotropy = 1;
+    }
+
+    async function downscaleTextureInPlace(tex, maxDim){
+      try{
+        const img = tex?.image;
+        const w = img?.width || 0;
+        const h = img?.height || 0;
+        if(!w || !h) return;
+        const m = Math.max(w, h);
+        if(m <= maxDim) return;
+
+        const scale = maxDim / m;
+        const tw = Math.max(1, Math.round(w * scale));
+        const th = Math.max(1, Math.round(h * scale));
+
+        // Prefer ImageBitmap resize when available; fallback to canvas.
+        if(typeof createImageBitmap === "function"){
+          try{
+            const bitmap = await createImageBitmap(img, {
+              resizeWidth: tw,
+              resizeHeight: th,
+              resizeQuality: "high"
+            });
+            tex.image = bitmap;
+            tex.needsUpdate = true;
+            return;
+          }catch{
+            // fall through
+          }
+        }
+
+        const c = document.createElement("canvas");
+        c.width = tw;
+        c.height = th;
+        const ctx = c.getContext("2d");
+        if(!ctx) return;
+        ctx.drawImage(img, 0, 0, tw, th);
+        tex.image = c;
+        tex.needsUpdate = true;
+      }catch{
+        // ignore: keep original texture
+      }
+    }
+
+    async function loadTextureResized(src, maxDim){
+      const res = await fetch(src, { cache: "force-cache" });
+      if(!res.ok) throw new Error(`HTTP ${res.status}`);
+      const blob = await res.blob();
+
+      // If we can't resize at decode time, we'll still return a texture and downscale later.
+      if(typeof createImageBitmap !== "function"){
+        const url = URL.createObjectURL(blob);
+        try{
+          const tex = await new Promise((resolve, reject)=>{
+            const loader = new THREE.TextureLoader();
+            loader.load(url, resolve, undefined, reject);
+          });
+          return tex;
+        } finally {
+          URL.revokeObjectURL(url);
+        }
+      }
+
+      // Decode directly to a smaller bitmap to reduce peak memory on iOS Safari.
+      // Use a conservative bound; aspect is preserved by the browser.
+      const bitmap = await createImageBitmap(blob, {
+        resizeWidth: maxDim,
+        resizeHeight: maxDim,
+        resizeQuality: "high"
+      });
+      const tex = new THREE.Texture(bitmap);
+      tex.needsUpdate = true;
+      return tex;
+    }
 
     const VignetteShader = {
       uniforms: {
@@ -1101,6 +1203,7 @@
 
     function addPhotoFromTexture(tex, label){
       tex.colorSpace = THREE.SRGBColorSpace;
+      configurePhotoTexture(tex);
       const imgW = tex.image.width || 1;
       const imgH = tex.image.height || 1;
       const aspect = imgW / imgH;
@@ -1213,15 +1316,28 @@
 
     function addPhotoFromUrlSafe(src, name, { silent = false, onSettled } = {}){
       if(!canAddPhotoSafe()) return false;
-      const loader = new THREE.TextureLoader();
-      loader.setCrossOrigin("anonymous");
-      loader.load(src, (tex)=>{
-        addPhotoFromTexture(tex, silent ? null : (name || "Default photo"));
-        if(typeof onSettled === "function") onSettled(true);
-      }, undefined, ()=>{
-        showNotice(`Photo load failed: ${name || src}`);
-        if(typeof onSettled === "function") onSettled(false);
-      });
+      (async ()=>{
+        try{
+          let tex;
+          if(DEVICE.isIOS && typeof fetch === "function"){
+            tex = await loadTextureResized(src, PERF.maxPhotoDim);
+            await downscaleTextureInPlace(tex, PERF.maxPhotoDim);
+          } else {
+            tex = await new Promise((resolve, reject)=>{
+              const loader = new THREE.TextureLoader();
+              loader.setCrossOrigin("anonymous");
+              loader.load(src, resolve, undefined, reject);
+            });
+            await downscaleTextureInPlace(tex, PERF.maxPhotoDim);
+          }
+
+          addPhotoFromTexture(tex, silent ? null : (name || "Default photo"));
+          if(typeof onSettled === "function") onSettled(true);
+        }catch{
+          showNotice(`Photo load failed: ${name || src}`);
+          if(typeof onSettled === "function") onSettled(false);
+        }
+      })();
       return true;
     }
 
@@ -1850,9 +1966,10 @@
       const w = window.innerWidth, h = window.innerHeight;
       camera.aspect = w/h;
       camera.updateProjectionMatrix();
+      renderer.setPixelRatio(Math.min(PERF.maxPixelRatio, window.devicePixelRatio || 1));
       renderer.setSize(w,h);
       composer.setSize(w,h);
-      bloom.setSize(w,h);
+      bloom.setSize(w * PERF.bloomScale, h * PERF.bloomScale);
       const pr = renderer.getPixelRatio();
       pointsMat.uniforms.uPixelRatio.value = pr;
       if(candleFX.candleMat) candleFX.candleMat.uniforms.uPixelRatio.value = pr;
