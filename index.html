@@ -150,11 +150,31 @@
     const noticeEl  = $("#notice");
     // Upload UI removed; photos come from DEFAULT_PHOTOS below.
 
+    const bootState = { t0: performance.now(), firstRender:false };
+    const photoLoad = { total:0, settled:0, loaded:0 };
+
     function showNotice(msg){
       noticeEl.style.display = "block";
       noticeEl.textContent = msg;
       clearTimeout(showNotice._t);
       showNotice._t = setTimeout(()=> noticeEl.style.display="none", 4500);
+    }
+
+    function updateLoading(now){
+      if(loadingEl.style.display === "none") return;
+      const elapsed = now - bootState.t0;
+      const minMs = 1200;
+      const maxMs = 7000;
+      const wantLoaded = (photoLoad.total > 0) ? Math.min(3, photoLoad.total) : 0;
+      const photosOk =
+        (photoLoad.total === 0) ||
+        (photoLoad.loaded >= wantLoaded) ||
+        (photoLoad.settled >= photoLoad.total) ||
+        (elapsed >= maxMs);
+
+      if(bootState.firstRender && elapsed >= minMs && photosOk){
+        loadingEl.style.display = "none";
+      }
     }
 
     function rand(a,b){ return a + Math.random()*(b-a); }
@@ -1146,13 +1166,23 @@
     }
 
     function loadDefaultPhotos(){
+      photoLoad.total = 0;
+      photoLoad.settled = 0;
+      photoLoad.loaded = 0;
       if(location.protocol === "file:"){
         showNotice("当前通过 file:// 打开，浏览器会禁止 WebGL 读取本地图片（CORS/origin=null）。请用 Live Server/本地服务器打开，例如 http://127.0.0.1:5500/cake_points.html");
         return;
       }
       for(const p of DEFAULT_PHOTOS){
         if(!p?.src) continue;
-        addPhotoFromUrlSafe(p.src, p.name, { silent: true });
+        const scheduled = addPhotoFromUrlSafe(p.src, p.name, {
+          silent: true,
+          onSettled: (ok)=>{
+            photoLoad.settled++;
+            if(ok) photoLoad.loaded++;
+          }
+        });
+        if(scheduled) photoLoad.total++;
       }
     }
 
@@ -1165,15 +1195,18 @@
       return true;
     }
 
-    function addPhotoFromUrlSafe(src, name, { silent = false } = {}){
-      if(!canAddPhotoSafe()) return;
+    function addPhotoFromUrlSafe(src, name, { silent = false, onSettled } = {}){
+      if(!canAddPhotoSafe()) return false;
       const loader = new THREE.TextureLoader();
       loader.setCrossOrigin("anonymous");
       loader.load(src, (tex)=>{
         addPhotoFromTexture(tex, silent ? null : (name || "Default photo"));
+        if(typeof onSettled === "function") onSettled(true);
       }, undefined, ()=>{
         showNotice(`Photo load failed: ${name || src}`);
+        if(typeof onSettled === "function") onSettled(false);
       });
+      return true;
     }
 
     /***************************************************************
@@ -1722,6 +1755,8 @@
       candleGroup.visible = true;
       updateCandles(t, candleMix, candleBurst);
       composer.render();
+      if(!bootState.firstRender) bootState.firstRender = true;
+      updateLoading(now);
 
       requestAnimationFrame(animate);
     }
@@ -1741,11 +1776,11 @@
     window.addEventListener("resize", onResize, { passive:true });
 
     (function boot(){
+      bootState.t0 = performance.now();
       setState(STATE.CAKE);
       loadDefaultPhotos();
       initMediaPipe();
       requestAnimationFrame((t0)=>{
-        loadingEl.style.display = "none";
         animate(t0);
       });
     })();
